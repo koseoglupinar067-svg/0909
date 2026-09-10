@@ -1,38 +1,192 @@
-name: Build APK
+name: Build & Release APK
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  Tetikleyiciler
+#   • main/master'a her push → unsigned debug + signed release APK artifact
+#   • "v*" tag push (örn. v1.5.0) → ayrıca GitHub Release oluşturur
+#   • Manuel tetikleme (Actions sekmesi → Run workflow)
+# ──────────────────────────────────────────────────────────────────────────────
 on:
+  workflow_dispatch:
   push:
-    branches: [ main ]
-  workflow_dispatch:      # Actions sekmesinden elle de çalıştırabilirsin
+    branches: [ "main", "master" ]
+    tags:     [ "v*" ]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+
+permissions:
+  contents: write   # GitHub Release oluşturabilmek için
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Ortam değişkenleri
+# ──────────────────────────────────────────────────────────────────────────────
+env:
+  # CloudburstMC/Protocol kaynak reposu (settings.gradle.kts ile uyumlu)
+  PROTOCOL_REPO: https://github.com/CloudburstMC/Protocol.git
+  PROTOCOL_BRANCH: develop   # ihtiyaca göre değiştirin
+  # NDK sürümü — app/build.gradle.kts'teki ndkVersion ile aynı olmalı
+  NDK_VERSION: "27.2.12479018"
 
 jobs:
+  # ────────────────────────────────────────────────────────────────────────────
   build:
+    name: Build APK
     runs-on: ubuntu-latest
 
     steps:
-      - name: Kodu çek
+      # ── 1. Kaynak kodunu çek ──────────────────────────────────────────────
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tag bilgisi için tam history
 
-      - name: JDK 17 kur
+      # ── 2. CloudburstMC/Protocol'u relay/Protocol dizinine clone et ───────
+      #    settings.gradle.kts bu dizinin varlığını kontrol ederek
+      #    bedrock-codec / bedrock-connection dependency'lerini kaynak koda yönlendirir.
+      - name: Clone CloudburstMC/Protocol
+        run: |
+          git clone --depth 1 --branch "$PROTOCOL_BRANCH" \
+            "$PROTOCOL_REPO" relay/Protocol
+
+      # ── 3. JDK 17 ─────────────────────────────────────────────────────────
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          distribution: temurin
+          java-version: "17"
 
-      # Projen bir .zip içinde duruyorsa (kaynak kod repoya zip olarak
-      # atılmışsa) bu adımın yorumunu kaldır ve dosya adını güncelle:
-      # - name: Kaynağı aç
-      #   run: unzip -o app-source.zip -d .
+      # ── 4. Android SDK + NDK ──────────────────────────────────────────────
+      - name: Set up Android SDK & NDK
+        uses: android-actions/setup-android@v3
 
-      - name: gradlew'a çalıştırma izni ver
+      - name: Install NDK ${{ env.NDK_VERSION }}
+        run: sdkmanager "ndk;${{ env.NDK_VERSION }}"
+
+      # ── 5. Gradle önbelleği ───────────────────────────────────────────────
+      - name: Cache Gradle files
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: APK build et
-        run: ./gradlew assembleDebug
+      # ── 6. İmzalama keystore'u hazırla ───────────────────────────────────
+      #
+      #  SEÇENEK A — Kalıcı keystore (Play Store / dağıtım için önerilir):
+      #    Repo → Settings → Secrets and variables → Actions bölümüne
+      #    aşağıdaki 4 secret'ı ekleyin:
+      #      KEYSTORE_BASE64  : base64'e çevrilmiş .jks / .p12 dosyası
+      #                         (komut: base64 -w 0 release.jks)
+      #      KEYSTORE_PASS    : keystore şifresi
+      #      KEY_ALIAS        : key alias adı
+      #      KEY_PASS         : key şifresi
+      #
+      #  SEÇENEK B — Geçici keystore (secret tanımlanmamışsa otomatik devreye girer):
+      #    Her build'de rastgele yeni bir keystore üretilir.
+      #    APK imzalı olur ama imza tutarsız — Play Store için UYGUN DEĞİL.
+      #
+      - name: Prepare release keystore
+        id: keystore
+        run: |
+          set -e
+          KEYSTORE_DIR="${{ runner.temp }}/keystore"
+          mkdir -p "$KEYSTORE_DIR"
+          KEYSTORE_PATH="$KEYSTORE_DIR/release.jks"
 
-      - name: APK'yı yükle
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            # ── SEÇENEK A: kalıcı keystore ──────────────────────────────
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > "$KEYSTORE_PATH"
+            KEYSTORE_PASS="${{ secrets.KEYSTORE_PASS }}"
+            KEY_ALIAS="${{ secrets.KEY_ALIAS }}"
+            KEY_PASS="${{ secrets.KEY_PASS }}"
+            echo "Kalıcı keystore kullanılıyor."
+          else
+            # ── SEÇENEK B: geçici keystore ──────────────────────────────
+            KEYSTORE_PASS="$(openssl rand -hex 16)"
+            KEY_ALIAS="noxnoclient-ci"
+            KEY_PASS="$KEYSTORE_PASS"
+            keytool -genkeypair \
+              -v \
+              -keystore "$KEYSTORE_PATH" \
+              -storetype PKCS12 \
+              -storepass "$KEYSTORE_PASS" \
+              -keypass  "$KEY_PASS" \
+              -alias    "$KEY_ALIAS" \
+              -keyalg   RSA \
+              -keysize  2048 \
+              -validity 3650 \
+              -dname    "CN=NoxNoClient CI, OU=CI, O=NoxNoClient, L=NA, S=NA, C=US"
+            echo "Geçici keystore oluşturuldu (kalıcı imza için KEYSTORE_BASE64 secret'ı tanımlayın)."
+          fi
+
+          # Değerleri gizleyerek output'a yaz
+          echo "::add-mask::$KEYSTORE_PASS"
+          echo "::add-mask::$KEY_PASS"
+          echo "path=$KEYSTORE_PATH"   >> "$GITHUB_OUTPUT"
+          echo "pass=$KEYSTORE_PASS"   >> "$GITHUB_OUTPUT"
+          echo "alias=$KEY_ALIAS"      >> "$GITHUB_OUTPUT"
+          echo "key_pass=$KEY_PASS"    >> "$GITHUB_OUTPUT"
+
+      # ── 7. Release APK derle ─────────────────────────────────────────────
+      - name: Assemble release APK
+        env:
+          KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          KEYSTORE_PASS: ${{ steps.keystore.outputs.pass }}
+          KEY_ALIAS:     ${{ steps.keystore.outputs.alias }}
+          KEY_PASS:      ${{ steps.keystore.outputs.key_pass }}
+        run: |
+          ./gradlew :app:assembleRelease \
+            --no-daemon \
+            --stacktrace \
+            --build-cache
+
+      # ── 8. Keystore'u sil ────────────────────────────────────────────────
+      - name: Remove keystore
+        if: always()
+        run: rm -rf "${{ runner.temp }}/keystore"
+
+      # ── 9. APK yolunu bul ────────────────────────────────────────────────
+      - name: Locate APK
+        id: apk
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "Release APK bulunamadı!" >&2
+            exit 1
+          fi
+          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+          # Versiyon adını build.gradle.kts'ten çek (artifact ismi için)
+          VERSION=$(grep -m1 'versionName' app/build.gradle.kts | grep -oP '"\K[^"]+')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # ── 10. APK'yı artifact olarak yükle ─────────────────────────────────
+      - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: NoxNoClient-v${{ steps.apk.outputs.version }}-release
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 30
 
+      # ── 11. Tag push ise GitHub Release oluştur ───────────────────────────
+      #    Sadece "v*" tag'larda çalışır (örn. git tag v1.5.0 && git push --tags)
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NoxNoClient ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: ${{ steps.apk.outputs.path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
