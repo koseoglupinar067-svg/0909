@@ -1,4 +1,4 @@
-name: Build APK/JAR
+name: Build
 
 on:
   workflow_dispatch:
@@ -16,29 +16,21 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Extract ZIP
-        shell: bash
         run: |
           mkdir -p source
           ZIP_FILE=$(find . -maxdepth 1 -type f -name "*.zip" | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "HATA: ZIP dosyasi bulunamadi!"
+            echo "ZIP bulunamadi!"
             exit 1
           fi
 
-          echo "ZIP: $ZIP_FILE"
+          echo "Extracting: $ZIP_FILE"
           unzip -q "$ZIP_FILE" -d source
 
-      - name: Find Gradle project
-        shell: bash
+      - name: Find Project
         run: |
-          echo "Gradle projeleri:"
-          find source -name "gradlew" -type f -print
-
-          if ! find source -name "gradlew" -type f | grep -q .; then
-            echo "HATA: ZIP icinde gradlew bulunamadi!"
-            exit 1
-          fi
+          find source -name "settings.gradle*" -o -name "build.gradle*" | head -50
 
       - name: Setup Java 17
         uses: actions/setup-java@v5
@@ -49,28 +41,28 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Make Gradle executable
-        shell: bash
-        run: |
-          GRADLEW=$(find source -name "gradlew" -type f | head -n 1)
-          chmod +x "$GRADLEW"
-
       - name: Build
         shell: bash
         run: |
-          GRADLEW=$(find source -name "gradlew" -type f | head -n 1)
-          PROJECT_DIR=$(dirname "$GRADLEW")
+          PROJECT_DIR=$(dirname "$(find source -name "settings.gradle*" -type f | head -n 1)")
+
+          if [ -z "$PROJECT_DIR" ] || [ "$PROJECT_DIR" = "." ]; then
+            echo "Gradle projesi bulunamadi!"
+            exit 1
+          fi
 
           cd "$PROJECT_DIR"
 
-          echo "Project: $(pwd)"
+          echo "Project directory:"
+          pwd
+
           echo "Java:"
           java -version
 
           echo "Gradle:"
-          ./gradlew --version
+          gradle --version
 
-          ./gradlew clean build --no-daemon
+          gradle clean build --no-daemon
 
       - name: Upload JAR
         uses: actions/upload-artifact@v4
